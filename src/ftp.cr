@@ -8,27 +8,6 @@ require "socket"
 require "mutex"
 require "time"
 
-class Socket
-  # Send out of bound data
-  #
-  # MSG_OOB is used with FTP during ABRT and SYST commands
-  # MSG_OOB = 0x1 in sys/socket.h
-  def send_oob(message)
-    slice = message.to_slice
-    bytes_sent = LibC.send(fd, slice.to_unsafe.as(Void*), slice.size, 0x1)
-    raise Errno.new("Error sending datagram") if bytes_sent == -1
-    bytes_sent
-  ensure
-    # see IO::FileDescriptor#unbuffered_write
-    if (writers = @writers) && !writers.empty?
-      add_write_event
-    end
-  end
-end
-
-#Hacky to reopen openssl scoket and re-extend it to include above
-class OpenSSL::SSL::Socket < Socket; end
-
 {% if !flag?(:without_openssl) %}
   require "openssl"
 {% end %}
@@ -138,7 +117,7 @@ module FTP
     # raises a Net::OpenTimeout exception. The default value is +120+.
     # If +ssl_handshake_timeout+ is +nil+, +open_timeout+ is used instead.
     property :ssl_handshake_timeout
-    @ssl_handshake_timeout = @open_timeout
+    @ssl_handshake_timeout = 120
 
     # Number of seconds to wait for one block to be read (via one read(2)
     # call). Any number may be used, including Floats for fractional
@@ -392,12 +371,13 @@ module FTP
         raise ArgumentError.new("A line must not contain CR or LF")
       end
       line = line + CRLF
-      connection_socket.flush_on_newline = true
+      connection_socket.flush
       connection_socket.write(line.to_slice)
     end
 
     # Reads a line from the socket.  If EOF, then it will raise EOFError
     private def getline # :nodoc:
+      connection_socket.flush
       line = connection_socket.gets(false) # if get EOF, nil
       line = line.try &.sub(/(\r\n|\n|\r)\z/, "") || ""
       if @debug_mode
@@ -1138,7 +1118,7 @@ module FTP
       if fractions = time["fractions"]
         usec = fractions.to_i * 10 ** (6 - fractions.to_s.size)
       end
-      Time.new(time["year"], time["month"], time["day"], time["hour"], time["min"], time["sec"], usec, Time::Kind::Utc)
+      Time.new(time["year"], time["month"], time["day"], time["hour"], time["min"], time["sec"], nanosecond: usec, location: Time::Location.local)
     }
     FACT_PARSERS = Hash(String, FactValueProc).new(CASE_DEPENDENT_PARSER)
     FACT_PARSERS["sizd"] = DECIMAL_PARSER
@@ -1326,7 +1306,8 @@ module FTP
       line = "ABOR" + CRLF
       print "put: ABOR\n" if @debug_mode
       #@socket.send(line, Socket::MSG_OOB)
-      connection_socket.send_oob(line)
+      connection_socket.write(line.to_slice)
+
       resp = getmultiline
       unless ["426", "226", "225"].includes?(resp[0, 3])
         raise FTPProtoError.new(resp)
@@ -1344,9 +1325,10 @@ module FTP
       if /[\r\n]/ =~ line
         raise ArgumentError.new("A line must not contain CR or LF")
       end
+      line = line + CRLF
       print "put: #{line}\n" if @debug_mode
       #@socket.send(line + CRLF, Socket::MSG_OOB)
-      connection_socket.send_oob(line + CRLF)
+      connection_socket.write(line.to_slice)
       return getresp
     end
 
